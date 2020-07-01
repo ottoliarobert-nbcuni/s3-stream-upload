@@ -44,6 +44,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * A WIP test using s3proxy to avoid requiring actually connecting to a real S3 bucket.
  */
+@Ignore
 public class StreamTransferManagerTest {
 
     static {

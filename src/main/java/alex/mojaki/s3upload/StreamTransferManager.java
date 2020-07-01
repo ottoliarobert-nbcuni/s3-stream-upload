@@ -1,11 +1,5 @@
 package alex.mojaki.s3upload;
 
-import com.amazonaws.services.s3.AmazonS3;
-import com.amazonaws.services.s3.model.*;
-import com.amazonaws.util.BinaryUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.io.ByteArrayInputStream;
 import java.math.BigInteger;
 import java.security.MessageDigest;
@@ -13,11 +7,32 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
-import java.util.concurrent.*;
+import java.util.TreeMap;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.model.AbortMultipartUploadRequest;
+import com.amazonaws.services.s3.model.CompleteMultipartUploadRequest;
+import com.amazonaws.services.s3.model.CompleteMultipartUploadResult;
+import com.amazonaws.services.s3.model.InitiateMultipartUploadRequest;
+import com.amazonaws.services.s3.model.InitiateMultipartUploadResult;
+import com.amazonaws.services.s3.model.ListPartsRequest;
+import com.amazonaws.services.s3.model.ObjectMetadata;
+import com.amazonaws.services.s3.model.PartETag;
+import com.amazonaws.services.s3.model.PartListing;
+import com.amazonaws.services.s3.model.PartSummary;
+import com.amazonaws.services.s3.model.PutObjectRequest;
+import com.amazonaws.services.s3.model.UploadPartRequest;
+import com.amazonaws.services.s3.model.UploadPartResult;
+import com.amazonaws.util.BinaryUtils;
 
 import static com.amazonaws.services.s3.internal.Constants.MB;
 
 // @formatter:off
+
 /**
  * Manages streaming of data to S3 without knowing the size beforehand and without keeping it all in memory or
  * writing to disk.
@@ -35,47 +50,47 @@ import static com.amazonaws.services.s3.internal.Constants.MB;
  * <p>
  * Here is an example. A lot of the code relates to setting up threads for creating data unrelated to the library. The
  * essential parts are commented.
-* <pre>{@code
-    AmazonS3Client client = new AmazonS3Client(awsCreds);
-
-    // Setting up
-    int numStreams = 2;
-    final StreamTransferManager manager = new StreamTransferManager(bucket, key, client)
-            .numStreams(numStreams)
-            .numUploadThreads(2)
-            .queueCapacity(2)
-            .partSize(10);
-    final List<MultiPartOutputStream> streams = manager.getMultiPartOutputStreams();
-
-    ExecutorService pool = Executors.newFixedThreadPool(numStreams);
-    for (int i = 0; i < numStreams; i++) {
-        final int streamIndex = i;
-        pool.submit(new Runnable() {
-            public void run() {
-                try {
-                    MultiPartOutputStream outputStream = streams.get(streamIndex);
-                    for (int lineNum = 0; lineNum < 1000000; lineNum++) {
-                        String line = generateData(streamIndex, lineNum);
-
-                        // Writing data and potentially sending off a part
-                        outputStream.write(line.getBytes());
-                    }
-
-                    // The stream must be closed once all the data has been written
-                    outputStream.close();
-                } catch (Exception e) {
-
-                    // Aborts all uploads
-                    manager.abort(e);
-                }
-            }
-        });
-    }
-    pool.shutdown();
-    pool.awaitTermination(5, TimeUnit.SECONDS);
-
-    // Finishing off
-    manager.complete();
+ * <pre>{@code
+ * AmazonS3Client client = new AmazonS3Client(awsCreds);
+ *
+ * // Setting up
+ * int numStreams = 2;
+ * final StreamTransferManager manager = new StreamTransferManager(bucket, key, client)
+ * .numStreams(numStreams)
+ * .numUploadThreads(2)
+ * .queueCapacity(2)
+ * .partSize(10);
+ * final List<MultiPartOutputStream> streams = manager.getMultiPartOutputStreams();
+ *
+ * ExecutorService pool = Executors.newFixedThreadPool(numStreams);
+ * for (int i = 0; i < numStreams; i++) {
+ * final int streamIndex = i;
+ * pool.submit(new Runnable() {
+ * public void run() {
+ * try {
+ * MultiPartOutputStream outputStream = streams.get(streamIndex);
+ * for (int lineNum = 0; lineNum < 1000000; lineNum++) {
+ * String line = generateData(streamIndex, lineNum);
+ *
+ * // Writing data and potentially sending off a part
+ * outputStream.write(line.getBytes());
+ * }
+ *
+ * // The stream must be closed once all the data has been written
+ * outputStream.close();
+ * } catch (Exception e) {
+ *
+ * // Aborts all uploads
+ * manager.abort(e);
+ * }
+ * }
+ * });
+ * }
+ * pool.shutdown();
+ * pool.awaitTermination(5, TimeUnit.SECONDS);
+ *
+ * // Finishing off
+ * manager.complete();
  * }</pre>
  * <p>
  * The final file on S3 will then usually be the result of concatenating all the data written to each stream,
@@ -125,11 +140,31 @@ public class StreamTransferManager {
     private static final int MAX_PART_NUMBER = 10000;
 
     public StreamTransferManager(String bucketName,
-                                 String putKey,
-                                 AmazonS3 s3Client) {
+                                      String putKey,
+                                      AmazonS3 s3Client) {
         this.bucketName = bucketName;
         this.putKey = putKey;
         this.s3Client = s3Client;
+    }
+
+    /**
+     * Constructor to be used when creating a StreamTransferManager for a resume multipart upload operation.
+     * @param bucketName The bucket name which contains the in-progress multipart upload
+     * @param putKey The key of the multipart upload
+     * @param s3Client Amazon S3 Client
+     * @param uploadId The Multipart Upload ID
+     * @param existingPartETags A list of Part ETags that have already been uploaded to S3
+     */
+    public StreamTransferManager(String bucketName,
+                                 String putKey,
+                                 AmazonS3 s3Client,
+                                 String uploadId,
+                                 List<PartETag> existingPartETags) {
+        this.bucketName = bucketName;
+        this.putKey = putKey;
+        this.s3Client = s3Client;
+        this.uploadId = uploadId;
+        this.partETags.addAll(existingPartETags);
     }
 
     /**
@@ -336,6 +371,59 @@ public class StreamTransferManager {
             for (int i = 0; i < numStreams; i++) {
                 int partNumberEnd = (i + 1) * MAX_PART_NUMBER / numStreams + 1;
                 MultiPartOutputStream multiPartOutputStream = new MultiPartOutputStream(partNumberStart, partNumberEnd, partSize, queue);
+                partNumberStart = partNumberEnd;
+                multiPartOutputStreams.add(multiPartOutputStream);
+            }
+
+            executorServiceResultsHandler = new ExecutorServiceResultsHandler<Void>(threadPool);
+            for (int i = 0; i < numUploadThreads; i++) {
+                executorServiceResultsHandler.submit(new UploadTask());
+            }
+            executorServiceResultsHandler.finishedSubmitting();
+        } catch (Throwable e) {
+            throw abort(e);
+        }
+
+        return multiPartOutputStreams;
+    }
+
+    /**
+     * Returns a MultipartOutputStreams that are set to resume from the last uploaded part.
+     * <p>
+     * If this method is to be used, clients must be sure that the instance of this class was created
+     * using the special {@link StreamTransferManager#StreamTransferManager(String, String, AmazonS3, String, List)}
+     * 'resume' constructor, so that the existing ETags and multipart Upload ID are present.
+     * <p>
+     * Clients must also pass a map containing the uploaded parts, so the returned stream knows which part to next
+     * upload.
+     *
+     * Finally, the InputStream that will be written to the returned OutputStream should be skipped to
+     * (lastUploadedPart * partSize) in order to pick up where it left off.
+     *
+     * @param existingParts  The parts that has already been uploaded via Multipart upload
+     * @return MultipartOutputStreams with partNumber set to resume with next part
+     */
+    public List<MultiPartOutputStream> getMultipartOutputStreamsForResume(TreeMap<Integer, PartSummary> existingParts) {
+        if (multiPartOutputStreams != null) {
+            return multiPartOutputStreams;
+        }
+
+        queue = new ClosableQueue<StreamPart>(queueCapacity);
+
+        if (uploadId == null) {
+            throw new IllegalStateException("Must confirm existing in-progress upload for " + uploadId);
+        }
+
+
+        try {
+            multiPartOutputStreams = new ArrayList<MultiPartOutputStream>();
+            ExecutorService threadPool = Executors.newFixedThreadPool(numUploadThreads);
+
+            int partNumberStart = existingParts.lastKey();
+
+            for (int i = 0; i < numStreams; i++) {
+                int partNumberEnd = (i + 1) * MAX_PART_NUMBER / numStreams + 1;
+                MultiPartOutputStream multiPartOutputStream = new MultiPartOutputStream(++partNumberStart, partNumberEnd, partSize, queue);
                 partNumberStart = partNumberEnd;
                 multiPartOutputStreams.add(multiPartOutputStream);
             }
